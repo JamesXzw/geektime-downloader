@@ -1,19 +1,26 @@
 package cmd
 
-import "github.com/chzyer/readline"
+import (
+	"github.com/manifoldco/promptui"
+)
 
-type noBellStdout struct{}
-
-func (n *noBellStdout) Write(p []byte) (int, error) {
-	if len(p) == 1 && p[0] == readline.CharBell {
-		return 0, nil
+func selectArticleFromPrompt(articles []string) (int, error) {
+	templates := &promptui.SelectTemplates{
+		Label:    "{{ . }}",
+		Active:   "\U0001F336 {{ . | red }}",
+		Inactive: "  {{ . | cyan }}",
+		Selected: "\U0001F336 {{ . | red | cyan }}",
 	}
-	return readline.Stdout.Write(p)
-}
 
-func (n *noBellStdout) Close() error {
-	return readline.Stdout.Close()
-}
+	prompt := promptui.Select{
+		Label:        "Select Article",
+		Items:        articles,
+		Templates:    templates,
+		Size:         4,
+		HideSelected: true,
+		Stdout:       NoBellStdout,
+	}
 
-// NoBellStdout fix annoying sound when select
-var NoBellStdout = &noBellStdout{}
+	i, _, err := prompt.Run()
+	return i, err
+}

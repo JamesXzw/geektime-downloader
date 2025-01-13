@@ -17,7 +17,6 @@ import (
 
 	"github.com/briandowns/spinner"
 	"github.com/manifoldco/promptui"
-	"github.com/nicoxiang/geektime-downloader/internal/audio"
 	"github.com/nicoxiang/geektime-downloader/internal/config"
 	"github.com/nicoxiang/geektime-downloader/internal/geektime"
 	"github.com/nicoxiang/geektime-downloader/internal/markdown"
@@ -64,29 +63,14 @@ type articleOpsOption struct {
 }
 
 func init() {
-	userHomeDir, _ := os.UserHomeDir()
+	downloadFolder = config.DefaultDownloadPath
+	columnOutputType = 3 // 1(pdf) + 2(markdown) = 3
 	concurrency = int(math.Ceil(float64(runtime.NumCPU()) / 2.0))
-	defaultDownloadFolder := filepath.Join(userHomeDir, config.GeektimeDownloaderFolder)
-
-	rootCmd.Flags().StringVarP(&phone, "phone", "u", "", "你的极客时间账号(手机号)")
-	rootCmd.Flags().MarkDeprecated("phone", "This flag is deprecated and will be removed in future versions. Please use '--gcid' and '--gcess' instead.")
-	rootCmd.Flags().MarkHidden("phone")
-	rootCmd.Flags().StringVar(&gcid, "gcid", "", "极客时间 cookie 值 gcid")
-	rootCmd.Flags().StringVar(&gcess, "gcess", "", "极客时间 cookie 值 gcess")
-	rootCmd.Flags().StringVarP(&downloadFolder, "folder", "f", defaultDownloadFolder, "专栏和视频课的下载目标位置")
-	rootCmd.Flags().StringVarP(&quality, "quality", "q", "sd", "下载视频清晰度(ld标清,sd高清,hd超清)")
-	rootCmd.Flags().BoolVar(&downloadComments, "comments", true, "是否需要专栏的第一页评论")
-	rootCmd.Flags().IntVar(&columnOutputType, "output", 1, "专栏的输出内容(1pdf,2markdown,4audio)可自由组合")
-	rootCmd.Flags().IntVar(&printPDFWaitSeconds, "print-pdf-wait", 8, "Chrome生成PDF前的等待页面加载时间, 单位为秒, 默认8秒")
-	rootCmd.Flags().IntVar(&printPDFTimeoutSeconds, "print-pdf-timeout", 60, "Chrome生成PDF的超时时间, 单位为秒, 默认60秒")
-	rootCmd.Flags().IntVar(&interval, "interval", 1, "下载资源的间隔时间, 单位为秒, 默认1秒")
-	rootCmd.Flags().BoolVar(&isEnterprise, "enterprise", false, "是否下载企业版极客时间资源")
-
-	rootCmd.MarkFlagsMutuallyExclusive("phone", "gcid")
-	rootCmd.MarkFlagsMutuallyExclusive("phone", "gcess")
-	rootCmd.MarkFlagsRequiredTogether("gcid", "gcess")
-
 	sp = spinner.New(spinner.CharSets[4], 100*time.Millisecond)
+
+	// 增加 PDF 相关的等待时间，避免超时
+	printPDFWaitSeconds = 15     // 增加到 15 秒
+	printPDFTimeoutSeconds = 120 // 增加到 120 秒
 }
 
 func setProductTypeOptions() {
@@ -102,61 +86,190 @@ func setProductTypeOptions() {
 	}
 }
 
+func logError(msg string) {
+	// 在下载目录下创建error.txt文件
+	errorFile := filepath.Join(downloadFolder, "error.txt")
+	f, err := os.OpenFile(errorFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Printf("无法创建错误日志文件: %v\n", err)
+		return
+	}
+	defer f.Close()
+
+	// 添加时间戳
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	logMsg := fmt.Sprintf("[%s] %s\n", timestamp, msg)
+
+	if _, err := f.WriteString(logMsg); err != nil {
+		fmt.Printf("写入错误日志失败: %v\n", err)
+	}
+}
+
 var rootCmd = &cobra.Command{
 	Use:   "geektime-downloader",
 	Short: "Geektime-downloader is used to download geek time lessons",
 	Run: func(cmd *cobra.Command, args []string) {
-		if quality != "ld" && quality != "sd" && quality != "hd" {
-			exitWithMsg("argument 'quality' is not valid")
-		}
-		if columnOutputType <= 0 || columnOutputType >= 8 {
-			exitWithMsg("argument 'columnOutputType' is not valid")
-		}
-		var readCookies []*http.Cookie
-		if phone != "" {
-			rc, err := config.ReadCookieFromConfigFile(phone)
-			checkError(err)
-			readCookies = rc
-		} else if gcid != "" && gcess != "" {
-			readCookies = readCookiesFromInput()
-		} else {
-			exitWithMsg("argument 'phone' or cookie value is not valid")
-		}
-		if readCookies == nil {
-			prompt := promptui.Prompt{
-				Label: "请输入密码",
-				Validate: func(s string) error {
-					if strings.TrimSpace(s) == "" {
-						return errors.New("密码不能为空")
-					}
-					return nil
+		ctx := cmd.Context()
+
+		// 读取配置
+		cfg, err := config.GetConfig()
+		checkError(err)
+
+		// 设置 cookies
+		cookies := readCookiesFromConfig(cfg)
+
+		fmt.Printf("正在验证登录...\n")
+		fmt.Printf("使用的 Cookie 值:\n")
+		fmt.Printf("GCID: %s\n", cfg.GCID)
+		fmt.Printf("GCESS: %s\n", cfg.GCESS)
+
+		// 验证登录
+		if err := geektime.Auth(cookies); err != nil {
+			fmt.Printf("登录验证失败: %v\n", err)
+			// 尝试重新构建 cookie
+			cookies = []*http.Cookie{
+				{
+					Name:     "GCID",
+					Value:    cfg.GCID,
+					Domain:   ".geekbang.org",
+					Path:     "/",
+					Secure:   true,
+					HttpOnly: true,
 				},
-				Mask:        '*',
-				HideEntered: true,
+				{
+					Name:     "GCESS",
+					Value:    cfg.GCESS,
+					Domain:   ".geekbang.org",
+					Path:     "/",
+					Secure:   true,
+					HttpOnly: true,
+				},
 			}
-			pwd, err := prompt.Run()
-			checkError(err)
-			sp.Prefix = "[ 正在登录... ]"
-			sp.Start()
-			readCookies, err = geektime.Login(phone, pwd)
-			if err != nil {
-				sp.Stop()
+
+			fmt.Printf("尝试重新验证登录...\n")
+			if err := geektime.Auth(cookies); err != nil {
 				checkError(err)
 			}
-			err = config.WriteCookieToConfigFile(phone, readCookies)
-			checkError(err)
-			sp.Stop()
-			fmt.Fprintln(os.Stderr, "登录成功")
+		}
+		fmt.Printf("登录验证成功\n")
+
+		geektimeClient = geektime.NewClient(cookies)
+
+		// 依次下载每个课程
+		for _, courseID := range cfg.CourseIDs {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						errMsg := fmt.Sprintf("课程 %s 下载失败: %v", courseID, r)
+						fmt.Printf("\n%s\n", errMsg)
+						logError(errMsg)
+					}
+				}()
+
+				id, err := strconv.Atoi(courseID)
+				if err != nil {
+					errMsg := fmt.Sprintf("无效的课程ID: %s, 跳过", courseID)
+					fmt.Printf("%s\n", errMsg)
+					logError(errMsg)
+					return
+				}
+
+				fmt.Printf("\n正在获取课程信息, ID: %s\n", courseID)
+				// 加载课程信息
+				course, err := geektimeClient.CourseInfo(id)
+				if err != nil {
+					errMsg := fmt.Sprintf("获取课程信息失败: %s, 错误: %v", courseID, err)
+					fmt.Printf("%s\n", errMsg)
+					logError(errMsg)
+					return
+				}
+
+				// 跳过视频课程
+				if course.IsVideo {
+					errMsg := fmt.Sprintf("课程 %s 为视频课程,跳过", course.Title)
+					fmt.Printf("%s\n", errMsg)
+					logError(errMsg)
+					return
+				}
+
+				selectedProduct = course
+
+				// 创建课程目录
+				pdfDir, mdDir, err := mkDownloadProjectDir(downloadFolder, "", cfg.GCID, course.Title)
+				if err != nil {
+					errMsg := fmt.Sprintf("创建目录失败: %v", err)
+					fmt.Printf("%s\n", errMsg)
+					logError(errMsg)
+					return
+				}
+
+				fmt.Printf("开始下载课程: %s\n", course.Title)
+				total := len(course.Articles)
+				var count int
+
+				// 下载所有文章
+				for _, article := range course.Articles {
+					maxRetries := 5
+					var downloadSuccess bool
+					for retry := 0; retry < maxRetries; retry++ {
+						if retry > 0 {
+							fmt.Printf("\n正在重试第 %d 次下载 %s...\n", retry+1, article.Title)
+							time.Sleep(time.Second * 5)
+						}
+
+						func() {
+							defer func() {
+								if r := recover(); r != nil {
+									errMsg := fmt.Sprintf("文章 %s 下载出错: %v", article.Title, r)
+									fmt.Printf("\n%s\n", errMsg)
+									logError(errMsg)
+								}
+							}()
+
+							skipped, err := downloadTextArticle(ctx, article, pdfDir, mdDir, false)
+							if err != nil {
+								errMsg := fmt.Sprintf("文章 %s 下载失败: %v", article.Title, err)
+								fmt.Printf("\n%s\n", errMsg)
+								logError(errMsg)
+								return
+							}
+							if skipped {
+								downloadSuccess = true
+								return
+							}
+						}()
+
+						if downloadSuccess {
+							break
+						}
+
+						if retry < maxRetries-1 {
+							waitRandomTime()
+						}
+					}
+
+					if !downloadSuccess {
+						errMsg := fmt.Sprintf("警告：文章 %s 下载失败", article.Title)
+						fmt.Printf("\n%s\n", errMsg)
+						logError(errMsg)
+					}
+
+					increaseDownloadedTextArticleCount(total, &count)
+
+					// 每篇文章下载后等待一下，避免请求太频繁
+					if count < total {
+						waitRandomTime()
+					}
+				}
+
+				fmt.Printf("\n课程 %s 下载完成\n", course.Title)
+			}()
+
+			// 课程之间增加等待时间
+			time.Sleep(time.Second * 3)
 		}
 
-		// first time auth check
-		if err := geektime.Auth(readCookies); err != nil {
-			checkError(err)
-		}
-
-		geektimeClient = geektime.NewClient(readCookies)
-		setProductTypeOptions()
-		selectProductType(cmd.Context())
+		fmt.Printf("\n所有课程下载任务完成！\n")
 	},
 }
 
@@ -217,14 +330,14 @@ func letInputProductID(ctx context.Context) {
 		}
 
 		if checkProductType(productInfo.Data.Info.Type) {
-			projectDir, err := mkDownloadProjectDir(downloadFolder, phone, gcid, productInfo.Data.Info.Title)
+			pdfDir, _, err := mkDownloadProjectDir(downloadFolder, phone, gcid, productInfo.Data.Info.Title)
 			checkError(err)
 
 			err = video.DownloadArticleVideo(ctx,
 				geektimeClient,
 				productInfo.Data.Info.Article.ID,
 				selectedProductType.SourceType,
-				projectDir,
+				pdfDir,
 				quality,
 				concurrency)
 
@@ -339,32 +452,43 @@ func handleSelectArticle(ctx context.Context, index int) {
 	}
 	a := selectedProduct.Articles[index-1]
 
-	projectDir, err := mkDownloadProjectDir(downloadFolder, phone, gcid, selectedProduct.Title)
+	// 创建目录
+	pdfDir, mdDir, err := mkDownloadProjectDir(downloadFolder, phone, gcid, selectedProduct.Title)
 	checkError(err)
-	downloadArticle(ctx, a, projectDir)
+
+	// 修改 downloadArticle 调用
+	downloadArticle(ctx, a, pdfDir, mdDir)
 	fmt.Printf("\r%s 下载完成", a.Title)
 	time.Sleep(time.Second)
 	selectArticle(ctx)
 }
 
 func handleDownloadAll(ctx context.Context) {
-	projectDir, err := mkDownloadProjectDir(downloadFolder, phone, gcid, selectedProduct.Title)
+	// 创建目录
+	pdfDir, mdDir, err := mkDownloadProjectDir(downloadFolder, phone, gcid, selectedProduct.Title)
 	checkError(err)
+
 	if isText() {
 		fmt.Printf("正在下载专栏 《%s》 中的所有文章\n", selectedProduct.Title)
 		total := len(selectedProduct.Articles)
-		var i int
+		var count int
 
 		for _, article := range selectedProduct.Articles {
-			skipped := downloadTextArticle(ctx, article, projectDir, false)
-			increaseDownloadedTextArticleCount(total, &i)
+			skipped, err := downloadTextArticle(ctx, article, pdfDir, mdDir, false)
+			if err != nil {
+				fmt.Printf("下载文章失败: %v\n", err)
+				continue
+			}
+
+			increaseDownloadedTextArticleCount(total, &count)
+
 			if !skipped {
 				waitRandomTime()
 			}
 		}
 	} else {
 		for _, article := range selectedProduct.Articles {
-			skipped := downloadVideoArticle(ctx, article, projectDir, false)
+			skipped := downloadVideoArticle(ctx, article, pdfDir, false)
 			if !skipped {
 				waitRandomTime()
 			}
@@ -378,30 +502,39 @@ func increaseDownloadedTextArticleCount(total int, i *int) {
 	fmt.Printf("\r已完成下载%d/%d", *i, total)
 }
 
-func downloadArticle(ctx context.Context, article geektime.Article, projectDir string) {
+func downloadArticle(ctx context.Context, article geektime.Article, pdfDir, mdDir string) {
 	if isText() {
 		sp.Prefix = fmt.Sprintf("[ 正在下载 《%s》... ]", article.Title)
 		sp.Start()
 		defer sp.Stop()
-		downloadTextArticle(ctx, article, projectDir, true)
+		skipped, err := downloadTextArticle(ctx, article, pdfDir, mdDir, true)
+		if err != nil {
+			fmt.Printf("下载文章失败: %v\n", err)
+		}
+		if !skipped {
+			waitRandomTime()
+		}
 	} else {
-		downloadVideoArticle(ctx, article, projectDir, true)
+		downloadVideoArticle(ctx, article, pdfDir, true)
 	}
 }
 
-func downloadTextArticle(ctx context.Context, article geektime.Article, projectDir string, overwrite bool) bool {
+func downloadTextArticle(ctx context.Context, article geektime.Article, pdfDir, mdDir string, overwrite bool) (bool, error) {
 	needDownloadPDF := columnOutputType&1 == 1
 	needDownloadMD := (columnOutputType>>1)&1 == 1
-	needDownloadAudio := (columnOutputType>>2)&1 == 1
 	skipped := true
 
 	articleInfo, err := geektimeClient.V1ArticleInfo(article.AID)
-	checkError(err)
+	if err != nil {
+		return false, fmt.Errorf("获取文章信息失败: %v", err)
+	}
 
 	hasVideo, videoURL := getVideoURLFromArticleContent(articleInfo.Data.ArticleContent)
 	if hasVideo && videoURL != "" {
-		err = video.DownloadMP4(ctx, article.Title, projectDir, []string{videoURL}, overwrite)
-		checkError(err)
+		err = video.DownloadMP4(ctx, article.Title, pdfDir, []string{videoURL}, overwrite)
+		if err != nil {
+			return false, fmt.Errorf("下载视频失败: %v", err)
+		}
 	}
 
 	if len(articleInfo.Data.InlineVideoSubtitles) > 0 {
@@ -409,14 +542,16 @@ func downloadTextArticle(ctx context.Context, article geektime.Article, projectD
 		for i, v := range articleInfo.Data.InlineVideoSubtitles {
 			videoURLs[i] = v.VideoURL
 		}
-		err = video.DownloadMP4(ctx, article.Title, projectDir, videoURLs, overwrite)
-		checkError(err)
+		err = video.DownloadMP4(ctx, article.Title, pdfDir, videoURLs, overwrite)
+		if err != nil {
+			return false, fmt.Errorf("下载内嵌视频失败: %v", err)
+		}
 	}
 
 	if needDownloadPDF {
 		innerSkipped, err := pdf.PrintArticlePageToPDF(ctx,
 			article.AID,
-			projectDir,
+			pdfDir,
 			article.Title,
 			geektimeClient.Cookies,
 			downloadComments,
@@ -424,33 +559,30 @@ func downloadTextArticle(ctx context.Context, article geektime.Article, projectD
 			printPDFTimeoutSeconds,
 			overwrite,
 		)
+		if err != nil {
+			return false, fmt.Errorf("生成PDF失败: %v", err)
+		}
 		if !innerSkipped {
 			skipped = false
 		}
-		checkError(err)
 	}
 
 	if needDownloadMD {
 		innerSkipped, err := markdown.Download(ctx,
 			articleInfo.Data.ArticleContent,
 			article.Title,
-			projectDir,
+			mdDir,
 			article.AID,
 			overwrite)
+		if err != nil {
+			return false, fmt.Errorf("生成Markdown失败: %v", err)
+		}
 		if !innerSkipped {
 			skipped = false
 		}
-		checkError(err)
 	}
 
-	if needDownloadAudio {
-		innerSkipped, err := audio.DownloadAudio(ctx, articleInfo.Data.AudioDownloadURL, projectDir, article.Title, overwrite)
-		if !innerSkipped {
-			skipped = false
-		}
-		checkError(err)
-	}
-	return skipped
+	return skipped, nil
 }
 
 func downloadVideoArticle(ctx context.Context, article geektime.Article, projectDir string, overwrite bool) bool {
@@ -509,17 +641,20 @@ func readCookiesFromInput() []*http.Cookie {
 	return cookies
 }
 
-func mkDownloadProjectDir(downloadFolder, phone, gcid, projectName string) (string, error) {
-	userName := phone
-	if gcid != "" {
-		userName = gcid
+func mkDownloadProjectDir(downloadFolder, phone, gcid, projectName string) (string, string, error) {
+	// 创建 PDF 目录
+	pdfPath := filepath.Join(downloadFolder, "pdf", filenamify.Filenamify(projectName))
+	if err := os.MkdirAll(pdfPath, os.ModePerm); err != nil {
+		return "", "", err
 	}
-	path := filepath.Join(downloadFolder, userName, filenamify.Filenamify(projectName))
-	err := os.MkdirAll(path, os.ModePerm)
-	if err != nil {
-		return "", err
+
+	// 创建 Markdown 目录
+	mdPath := filepath.Join(downloadFolder, "markdown", filenamify.Filenamify(projectName))
+	if err := os.MkdirAll(mdPath, os.ModePerm); err != nil {
+		return "", "", err
 	}
-	return path, nil
+
+	return pdfPath, mdPath, nil
 }
 
 func mkDownloadProjectSectionDir(downloadFolder, sectionName string) (string, error) {
@@ -606,4 +741,29 @@ func Execute() {
 	if err := rootCmd.ExecuteContext(ctx); err != nil {
 		checkError(err)
 	}
+}
+
+func readCookiesFromConfig(cfg *config.Config) []*http.Cookie {
+	oneyear := time.Now().Add(180 * 24 * time.Hour)
+	cookies := make([]*http.Cookie, 2)
+
+	cookies[0] = &http.Cookie{
+		Name:     geektime.GCID,
+		Value:    cfg.GCID,
+		Domain:   ".geekbang.org",
+		Path:     "/",
+		HttpOnly: true,
+		Expires:  oneyear,
+	}
+
+	cookies[1] = &http.Cookie{
+		Name:     geektime.GCESS,
+		Value:    cfg.GCESS,
+		Domain:   ".geekbang.org",
+		Path:     "/",
+		HttpOnly: true,
+		Expires:  oneyear,
+	}
+
+	return cookies
 }

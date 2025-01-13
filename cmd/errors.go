@@ -1,54 +1,37 @@
 package cmd
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"os"
-
-	"github.com/manifoldco/promptui"
-	"github.com/nicoxiang/geektime-downloader/internal/config"
-	"github.com/nicoxiang/geektime-downloader/internal/geektime"
-	"github.com/nicoxiang/geektime-downloader/internal/pkg/logger"
 )
+
+// NoBellStdoutWriter ...
+type NoBellStdoutWriter struct{}
+
+// NewNoBellStdoutWriter ...
+func NewNoBellStdoutWriter() *NoBellStdoutWriter {
+	return &NoBellStdoutWriter{}
+}
+
+func (w *NoBellStdoutWriter) Write(b []byte) (int, error) {
+	if len(b) > 0 && b[0] == 7 {
+		return 0, nil
+	}
+	return os.Stdout.Write(b)
+}
+
+// Close implements io.Closer interface
+func (w *NoBellStdoutWriter) Close() error {
+	return nil
+}
 
 func checkError(err error) {
 	if err != nil {
-		// special newline case
-		if errors.Is(err, geektime.ErrGeekTimeRateLimit) ||
-			os.IsTimeout(err) {
-			fmt.Println()
+		if sp != nil {
+			sp.Stop()
 		}
-
-		var eg *geektime.ErrGeekTimeAPIBadCode
-		if errors.Is(err, context.Canceled) ||
-			errors.Is(err, promptui.ErrInterrupt) {
-			os.Exit(1)
-		} else if errors.As(err, &eg) {
-			exitWithMsg(err.Error())
-		} else if errors.Is(err, geektime.ErrWrongPassword) ||
-			errors.Is(err, geektime.ErrTooManyLoginAttemptTimes) {
-			exitWithMsg(err.Error())
-		} else if errors.Is(err, geektime.ErrGeekTimeRateLimit) ||
-			errors.Is(err, geektime.ErrAuthFailed) {
-			exitAndRemoveConfig(err)
-		} else if os.IsTimeout(err) {
-			logger.Error(err, "Request Timeout")
-			exitWithMsg("请求超时")
-		} else {
-			logger.Error(err, "An error occurred")
-			fmt.Fprintf(os.Stderr, "An error occurred: %v\n", err.Error())
-			os.Exit(1)
-		}
+		exitWithMsg(err.Error())
 	}
-}
-
-func exitAndRemoveConfig(err error) {
-	fmt.Fprintln(os.Stderr, err.Error())
-	if err := config.RemoveConfig(phone); err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
-	}
-	os.Exit(1)
 }
 
 func exitWithMsg(msg string) {
