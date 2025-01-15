@@ -47,6 +47,7 @@ var (
 	geektimeClient         *geektime.Client
 	isEnterprise           bool
 	waitRand               = rand.New(rand.NewSource(time.Now().UnixNano()))
+	lastError              string
 )
 
 type productTypeSelectOption struct {
@@ -68,9 +69,10 @@ func init() {
 	concurrency = int(math.Ceil(float64(runtime.NumCPU()) / 2.0))
 	sp = spinner.New(spinner.CharSets[4], 100*time.Millisecond)
 
-	// 增加 PDF 相关的等待时间，避免超时
-	printPDFWaitSeconds = 15     // 增加到 15 秒
-	printPDFTimeoutSeconds = 120 // 增加到 120 秒
+	// 增加等待时间，避免触发限流
+	interval = 5                 // 每篇文章下载后等待5秒
+	printPDFWaitSeconds = 15     // PDF 生成等待时间
+	printPDFTimeoutSeconds = 120 // PDF 生成超时时间
 }
 
 func setProductTypeOptions() {
@@ -211,10 +213,19 @@ var rootCmd = &cobra.Command{
 				for _, article := range course.Articles {
 					maxRetries := 5
 					var downloadSuccess bool
+					var rateLimitCount int // 记录触发限流次数
+					lastError = ""         // 重置最后一次错误
+
 					for retry := 0; retry < maxRetries; retry++ {
 						if retry > 0 {
+							waitTime := 5
+							if strings.Contains(lastError, "已触发限流") {
+								rateLimitCount++
+								waitTime = 30 * rateLimitCount // 累加等待时间
+								handleRateLimit(courseID, article)
+							}
 							fmt.Printf("\n正在重试第 %d 次下载 %s...\n", retry+1, article.Title)
-							time.Sleep(time.Second * 5)
+							time.Sleep(time.Duration(waitTime) * time.Second)
 						}
 
 						func() {
@@ -228,6 +239,10 @@ var rootCmd = &cobra.Command{
 
 							skipped, err := downloadTextArticle(ctx, article, pdfDir, mdDir, false)
 							if err != nil {
+								if strings.Contains(err.Error(), "已触发限流") {
+									lastError = err.Error()
+									return
+								}
 								errMsg := fmt.Sprintf("文章 %s 下载失败: %v", article.Title, err)
 								fmt.Printf("\n%s\n", errMsg)
 								logError(errMsg)
@@ -237,14 +252,11 @@ var rootCmd = &cobra.Command{
 								downloadSuccess = true
 								return
 							}
+							downloadSuccess = true
 						}()
 
 						if downloadSuccess {
 							break
-						}
-
-						if retry < maxRetries-1 {
-							waitRandomTime()
 						}
 					}
 
@@ -256,7 +268,7 @@ var rootCmd = &cobra.Command{
 
 					increaseDownloadedTextArticleCount(total, &count)
 
-					// 每篇文章下载后等待一下，避免请求太频繁
+					// 每篇文章下载后等待更长时间
 					if count < total {
 						waitRandomTime()
 					}
@@ -265,8 +277,8 @@ var rootCmd = &cobra.Command{
 				fmt.Printf("\n课程 %s 下载完成\n", course.Title)
 			}()
 
-			// 课程之间增加等待时间
-			time.Sleep(time.Second * 3)
+			// 课程之间增加更长的等待时间
+			time.Sleep(time.Second * 10)
 		}
 
 		fmt.Printf("\n所有课程下载任务完成！\n")
@@ -522,13 +534,38 @@ func downloadArticle(ctx context.Context, article geektime.Article, pdfDir, mdDi
 func downloadTextArticle(ctx context.Context, article geektime.Article, pdfDir, mdDir string, overwrite bool) (bool, error) {
 	needDownloadPDF := columnOutputType&1 == 1
 	needDownloadMD := (columnOutputType>>1)&1 == 1
-	skipped := true
 
+	// 检查文件是否已存在
+	pdfExists := false
+	mdExists := false
+
+	if needDownloadPDF {
+		pdfPath := filepath.Join(pdfDir, filenamify.Filenamify(article.Title)+".pdf")
+		if _, err := os.Stat(pdfPath); err == nil {
+			pdfExists = true
+		}
+	}
+
+	if needDownloadMD {
+		mdPath := filepath.Join(mdDir, filenamify.Filenamify(article.Title)+".md")
+		if _, err := os.Stat(mdPath); err == nil {
+			mdExists = true
+		}
+	}
+
+	// 如果所有需要的文件都存在，直接跳过
+	if (!needDownloadPDF || pdfExists) && (!needDownloadMD || mdExists) {
+		fmt.Printf("\n文章 %s 已存在，跳过下载\n", article.Title)
+		return true, nil
+	}
+
+	// 获取文章信息
 	articleInfo, err := geektimeClient.V1ArticleInfo(article.AID)
 	if err != nil {
 		return false, fmt.Errorf("获取文章信息失败: %v", err)
 	}
 
+	// 处理视频内容
 	hasVideo, videoURL := getVideoURLFromArticleContent(articleInfo.Data.ArticleContent)
 	if hasVideo && videoURL != "" {
 		err = video.DownloadMP4(ctx, article.Title, pdfDir, []string{videoURL}, overwrite)
@@ -548,8 +585,9 @@ func downloadTextArticle(ctx context.Context, article geektime.Article, pdfDir, 
 		}
 	}
 
-	if needDownloadPDF {
-		innerSkipped, err := pdf.PrintArticlePageToPDF(ctx,
+	// 只下载不存在的 PDF 文件
+	if needDownloadPDF && !pdfExists {
+		_, err := pdf.PrintArticlePageToPDF(ctx,
 			article.AID,
 			pdfDir,
 			article.Title,
@@ -562,13 +600,11 @@ func downloadTextArticle(ctx context.Context, article geektime.Article, pdfDir, 
 		if err != nil {
 			return false, fmt.Errorf("生成PDF失败: %v", err)
 		}
-		if !innerSkipped {
-			skipped = false
-		}
 	}
 
-	if needDownloadMD {
-		innerSkipped, err := markdown.Download(ctx,
+	// 只下载不存在的 Markdown 文件
+	if needDownloadMD && !mdExists {
+		_, err := markdown.Download(ctx,
 			articleInfo.Data.ArticleContent,
 			article.Title,
 			mdDir,
@@ -577,12 +613,9 @@ func downloadTextArticle(ctx context.Context, article geektime.Article, pdfDir, 
 		if err != nil {
 			return false, fmt.Errorf("生成Markdown失败: %v", err)
 		}
-		if !innerSkipped {
-			skipped = false
-		}
 	}
 
-	return skipped, nil
+	return false, nil
 }
 
 func downloadVideoArticle(ctx context.Context, article geektime.Article, projectDir string, overwrite bool) bool {
@@ -715,7 +748,8 @@ func getVideoURLFromArticleContent(content string) (hasVideo bool, videoURL stri
 
 // waitRandomTime wait interval seconds of time plus a 2000ms max jitter
 func waitRandomTime() {
-	randomMillis := interval*1000 + waitRand.Intn(2000)
+	// 基础等待时间 + 随机等待时间(0-3秒)
+	randomMillis := interval*1000 + waitRand.Intn(3000)
 	time.Sleep(time.Duration(randomMillis) * time.Millisecond)
 }
 
@@ -766,4 +800,12 @@ func readCookiesFromConfig(cfg *config.Config) []*http.Cookie {
 	}
 
 	return cookies
+}
+
+// 添加限流处理函数
+func handleRateLimit(courseID string, article geektime.Article) {
+	errMsg := fmt.Sprintf("触发限流，等待 30 秒后重试: 课程 %s, 文章 %s", courseID, article.Title)
+	fmt.Printf("\n%s\n", errMsg)
+	logError(errMsg)
+	time.Sleep(30 * time.Second) // 触发限流后等待30秒
 }
